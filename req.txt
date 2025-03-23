@@ -1,0 +1,8 @@
+transformers
+numpy
+SpeechRecognition
+PyAudio
+peft
+kokoro>=0.9.2
+sounddevice
+ipython
