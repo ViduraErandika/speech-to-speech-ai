@@ -1,8 +1,8 @@
 from kokoro import KPipeline
 import sounddevice as sd
-from threading import Thread
+from threading import Thread, Event
 import torch
-from queue import Queue
+from queue import Queue, Empty
 
 class KokoroStreamingTTS:
     """
@@ -32,6 +32,11 @@ class KokoroStreamingTTS:
             print(f"Using device for TTS: {self.device}")
             
         self.audio_queue = Queue()
+
+        self.interrupt_event = Event()
+        self.generation_thread = None
+        self.playback_thread = None
+        self.is_speaking = False
         print("KokoroStreamingTTS initialized")
     
     def split_into_sentences(self, text):
@@ -66,33 +71,101 @@ class KokoroStreamingTTS:
             text (str): The text to convert to speech
             voice (str): The voice to use
         """
-        generator = self.pipeline(text, voice=voice, speed=1, split_pattern=r'\n+')
-        
-        for i, (gs, ps, audio) in enumerate(generator):
-            self.audio_queue.put(audio)  # Add audio chunk to the queue
-        self.audio_queue.put(None) 
-        print("Audio generation complete")
+        try:
+            generator = self.pipeline(text, voice=voice, speed=1, split_pattern=r'\n+')
+            
+            for i, (gs, ps, audio) in enumerate(generator):
+                if self.interrupt_event.is_set():
+                    print("Audio generation interrupted")
+                    break
+                self.audio_queue.put(audio)  # Add audio chunk to the queue
+            
+            if not self.interrupt_event.is_set():
+                self.audio_queue.put(None)  # Mark end of generation
+                print("Audio generation complete")
+        except Exception as e:
+            print(f"Error in audio generation: {str(e)}")
+            if not self.interrupt_event.is_set():
+                self.audio_queue.put(None) 
     
     def play_audio(self):
-        while True:
-            audio = self.audio_queue.get()  # Get the next audio chunk
-            if audio is None:  # Check if generation is complete
-                break
-            sd.play(audio, 24000, device=3)
-            sd.wait()  # Wait for the current chunk to finish playing
+        try:
+            self.is_speaking = True
+            while not self.interrupt_event.is_set():
+                try:
+                    audio = self.audio_queue.get(timeout=0.5)  # Get with timeout for responsiveness
+                    if audio is None:  # Check if generation is complete
+                        break
+                    sd.play(audio, 24000, device=3)
+                    sd.wait()  # Wait for the current chunk to finish playing
+                    self.audio_queue.task_done()
+                except Empty:
+                    continue  # No audio yet, continue checking
             
-
+            if self.interrupt_event.is_set():
+                # Clear the queue if interrupted
+                if not self.audio_queue.qsize() == 0:
+                    self.audio_queue.queue.clear()
+        except Exception as e:
+            print(f"Error in audio playback: {str(e)}")
+        finally:
+            self.is_speaking = False
+            print("Audio playback stopped")
+            
+    def is_currently_speaking(self):
+        """
+        Check if speech is currently being generated or played.
+        
+        Returns:
+            bool: True if speaking, False otherwise
+        """
+        return self.is_speaking
     
     def speak(self, text, voice):
-        generation_thread = Thread(target=self.generate_audio, args=(text, voice))
-        generation_thread.start()
-
-        # Start playing audio immediately
-        self.play_audio()
-
-        # Wait for the generation thread to finish
-        generation_thread.join() 
+        self.stop_speaking()
+        
+        # Reset the interrupt flag
+        self.interrupt_event.clear()
+        
+        # Clear the queue
+        if not self.audio_queue.qsize() == 0:
+            self.audio_queue.queue.clear()
+        
+        # Start new generation and playback threads
+        self.generation_thread = Thread(target=self.generate_audio, args=(text, voice))
+        self.generation_thread.daemon = True
+        self.generation_thread.start()
+        
+        self.playback_thread = Thread(target=self.play_audio)
+        self.playback_thread.daemon = True
+        self.playback_thread.start()
+        
         return True
+    
+    def stop_speaking(self):
+        """
+        Stop any ongoing speech generation and playback.
+        
+        Returns:
+            bool: True if speech was stopped, False if nothing was playing
+        """
+        if self.is_speaking or (self.generation_thread and self.generation_thread.is_alive()):
+            self.interrupt_event.set()  # Signal interruption
+            
+            # Stop any active playback
+            sd.stop()
+            
+            # Wait for threads to clean up, but with a timeout
+            if self.generation_thread and self.generation_thread.is_alive():
+                self.generation_thread.join(timeout=0.5)
+            
+            if self.playback_thread and self.playback_thread.is_alive():
+                self.playback_thread.join(timeout=0.5)
+            
+            self.is_speaking = False
+            print("Speech stopped")
+            return True
+        return False
     
 
 # if __name__ == "__main__":
